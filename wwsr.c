@@ -16,7 +16,7 @@
 #include <usb.h>
 
 struct usb_dev_handle *devh;
-int	ret,mempos=0,showall=0,shownone=0,resetws=0,pdebug=0,postprocess=0;
+int	ret,mempos=0,showall=0,shownone=0,resetws=0,pdebug=0,postprocess=0,showJSON=0;
 int	o1,o2,o3,o4,o5,o6,o7,o8,o9,o10,o11,o12,o13,o14,o15;
 char	buf[1000],*endptr;
 char	buf2[400];
@@ -163,7 +163,7 @@ void read_arguments(int argc, char **argv) {
 	char *mempos1=0,*endptr;
   	shownone=0;
   	o1=0;
-	while ((c = getopt (argc, argv, "akwosiurthp:zyx")) != -1)
+	while ((c = getopt (argc, argv, "akwosiurthJp:zyx")) != -1)
 	{
          switch (c)
            {
@@ -220,6 +220,10 @@ void read_arguments(int argc, char **argv) {
   	     resetws=1;
 	     shownone=1;
              break;
+	   case 'J':
+	     showJSON=1;
+	     shownone=1;
+	     break;
            case '?':
              if (isprint (optopt))
                fprintf (stderr, "Unknown option `-%c'.\n", optopt);
@@ -245,12 +249,13 @@ void read_arguments(int argc, char **argv) {
 		printf(" -r	Show rain\n");
 		printf(" -w	Show wind\n");
 		printf(" -o	other \n\n");
+		printf(" -J     Show JSON\n");
 		exit(0);
 	}
 	if (mempos1!=0) {
 	    	mempos = strtol(mempos1, &endptr, 16);
 	} else {
-		printf("Reading last updated record from device\n");
+	        if ( !showJSON) printf("Reading last updated record from device\n");
 	}
 }
 
@@ -479,6 +484,11 @@ buf4.rain1 = buf2[286];
 buf4.oth2 = buf2[287];
 */
 
+if ( showJSON) {
+  printf("{\"temperature\":%4.1f,\"humidity\":%d,\"pressure\":%6.1f}\n",
+	 buf5.tindoor/10.0, buf5.hindoor, buf5.pressure/10.0);
+  exit(0);
+}
 
 
 printf("Last saved values:\n");
