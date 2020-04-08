@@ -25,8 +25,18 @@
      it's log possition to "zero". This takes max 24h to
      cleanup itself. To correct this, I need to know exact
      min and max possition of weatherstation log)
- * 2009 apr 20 Petr Zitny (petr@zitny.net)
- *  
+ *  patch for xml - added new values
+ * 2009 apr 19 Lukas Zvonar (lukic@mag-net.sk)
+ *  corrected reading of -d (dump address and size) and -a (vendor and product
+    number) parameters ( from int to short int) - which lead to overwriting
+    variables.. This could be problem on gcc compilers interpreting
+    int as 2 byte and short as 1 byte. But now is int defined as 4 byte
+    and short as 2 byte.
+ * 2009 apr 21 Lukas Zvonar (lukic@mag-net.sk)
+ *  added errstr, which is printed out if station lost connection to outdoor unit
+    or somehow data from weather station are out of limits. Thanks to Petr Zitny.
+ * 2009 apr 23 Petr Zitny (petr@zitny.net)
+ *  repair some if for test lost connection to outdoor unit
  */
 #include <stdio.h>
 #include <string.h>
@@ -55,7 +65,9 @@ int ws_print(char *format,uint8_t *buffer,uint8_t *buffer2,uint8_t *buffer3);
 int ws_dump(uint16_t address,uint8_t *buffer,uint16_t size,uint8_t width);
 
 int altitude=0;	//default altitude is sea level - change it if you need, or use -A parameter
-int position=0;	//default weather station log position - change it if you need, or use -p parameter
+int position=0;	//default position in log is "now". Altering this can lead to read some of stored values in weather station
+
+char* errorstring="NaN"; //what to write if value is out of range (e.g. outdoor unit is disconnected)
 
 typedef enum log_event
 {
@@ -88,12 +100,12 @@ int main(int argc, char **argv)
   _log_error=stderr;
   _log_info=stdout;
   
-	while (rv==0 && (c=getopt(argc,argv,"hf:v?d:a:A:p:x"))!=-1)
+	while (rv==0 && (c=getopt(argc,argv,"h?vxf:d:a:A:p:e:"))!=-1)
 	{
 		switch (c)
 		{
 			case 'a': // set device id
-				sscanf(optarg,"%X:%X",&vendor,&product);
+				sscanf(optarg,"%hX:%hX",&vendor,&product);
 				logger(LOG_DEBUG,"main","USB device set to vendor=%04X product=%04X",vendor,product);
 				break;
 
@@ -125,6 +137,11 @@ int main(int argc, char **argv)
 				logger(LOG_DEBUG,"main","Format output using '%s'",optarg);
 				format=optarg;
 				break;
+
+			case 'e': // Error string
+				logger(LOG_DEBUG,"main","Error string set to: '%s'",optarg);
+				errorstring=optarg;
+				break;
 			
 			case 'd': // Dump raw data from weather station
 			{
@@ -133,13 +150,13 @@ int main(int argc, char **argv)
 				a=0;
 				s=0x100;
 				w=16;
-//				sscanf(optarg,"0x%X:0x%X",&a,&s);
-				if (sscanf(optarg,"0x%X:0x%X",&a,&s)<2)
-				if (sscanf(optarg,"0x%X:%u",&a,&s)<2)
-				if (sscanf(optarg,"%u:0x%X",&a,&s)<2)
-				if (sscanf(optarg,"%u:%u",&a,&s)<2)
-				if (sscanf(optarg,":0x%X",&s)<1)
-					sscanf(optarg,":%u",&s);
+//				sscanf(optarg,"0x%hX:0x%hX",&a,&s);
+				if (sscanf(optarg,"0x%hX:0x%hX",&a,&s)<2)
+				if (sscanf(optarg,"0x%hX:%hu",&a,&s)<2)
+				if (sscanf(optarg,"%hu:0x%hX",&a,&s)<2)
+				if (sscanf(optarg,"%hu:%hu",&a,&s)<2)
+				if (sscanf(optarg,":0x%hX",&s)<1)
+					sscanf(optarg,":%hu",&s);
 				
 				logger(LOG_DEBUG,"main","Dump options address=%u size=%u",a,s);
 				
@@ -170,16 +187,20 @@ int main(int argc, char **argv)
 			}
 			
 			case '?':
+			case 'h':
 				help=1;
 				printf("Wireless Weather Station Reader v0.1\n");
 				printf("(C) 2007 Michael Pendec\n\n");
 				printf("options\n");
-				printf(" -? Display help\n");
-				printf(" -a v:p Change the vendor:product address of the usb device from the default\n");
-				printf(" -A <alt in m> Change altitude\n");
-				printf(" -p Alter position in weather station log from current position (can be +- value)\n");
-				printf(" -v Verbose output, enable debug and warning messages\n");
-				printf(" -f Format output to user defined string\n");
+				printf(" -? -h            Display this help\n");
+				printf(" -a <v>:<p>       Change the vendor:product address of the usb device from the default\n");
+				printf(" -A <alt in m>    Change altitude\n");
+				printf(" -p <pos>         Alter position in weather station log from current position (can be +- value)\n");
+				printf(" -v               Verbose output, enable debug and warning messages\n");
+				printf(" -d [addr]:[len]  Dump length bytes from address\n");
+                                printf(" -x               XML output\n");
+                                printf(" -e <errstr>      Write this errstr if measured value is out of range (e.g. outdoor unit is disconnected)\n");
+				printf(" -f <string>      Format output to user defined string\n");
 				printf("    %%h - inside humidity\n");
 				printf("    %%H - outside humidity\n");
 				printf("    %%t - inside temperature\n");
@@ -198,8 +219,6 @@ int main(int argc, char **argv)
 				printf("    %%F - rain last 24h in mm\n");
 				printf("    %%R - rain total from meteostation start in mm\n");
 				printf("    %%N - now - date/time string\n");
-                                printf(" -x XML output\n");
-				printf(" -d [address]:[length] Dump length bytes from address\n");
 		}
 	}
 	
@@ -411,7 +430,7 @@ int ws_print(char *format,uint8_t *buffer,uint8_t *buffer2,uint8_t *buffer3)
                           else    tempi=buffer[0x02]+(buffer[0x03]<<8) ^ 0x0000;   //
         temp=(float)(tempo)/10;		//outdoor temp for computing Tdew, Windchill and Rel.pressure
 
-//        if (abs(temp) > 10000) {printf("err"); *format=(char)""; }	//if temp is over +-1000 �C, we lost connection to outdoor unit, so write error
+//        if (abs(temp) > 10000) {printf("err"); *format=(char)""; }	//if temp is over +-1000 °C, we lost connection to outdoor unit, so write error
 
 
 	for (;*format;format++)
@@ -421,42 +440,57 @@ int ws_print(char *format,uint8_t *buffer,uint8_t *buffer2,uint8_t *buffer3)
 			switch (*++format)
 			{
 				case 'h': // inside humidity
+					if ((buffer[0x01] > 100) || (buffer[0x01] == 0)) printf("%s",errorstring); else
 					printf("%d",buffer[0x01]);
 					break;
 				
 				case 'H': // outside humidity
+					if ((buffer[0x04] > 100) || (buffer[0x04] == 0)) printf("%s",errorstring); else
 					printf("%d",buffer[0x04]);
 					break;
 				
 				case 't': // inside temperature
+					if ((tempi > 2000) || (tempi < -2000)) printf("%s",errorstring); else
 					printf("%0.1f",(float)(tempi)/10);
 					break;
 				
 				case 'T': // outside temperature
+					if ((temp > 200) || (temp < -200)) printf("%s",errorstring); else
 					printf("%0.1f",temp);
 					break;
 
 				case 'C': // dew point based on outside temperature (formula from wikipedia)
-					hum=(float)buffer[0x04]/100; 			 //humidity / 100
-					if (hum == 0) hum=0.001;			 //in case of 0% humidity
-					gama=(17.271*temp)/(237.7+temp) + log (hum);	 //gama=aT/(b+T) + ln (RH/100)
-					tw= (237.7 * gama) / (17.271 - gama);		 //Tdew= (b * gama) / (a - gama)
-					printf("%0.1f",tw);
+					if ((temp > 200) || (temp < -200) || (buffer[0x04] > 100)) printf("%s",errorstring); 
+					else
+					{
+					    hum=(float)buffer[0x04]/100; 			 //humidity / 100
+					    if (hum == 0) hum=0.001;				 //in case of 0% humidity
+					    gama=(17.271*temp)/(237.7+temp) + log (hum);	 //gama=aT/(b+T) + ln (RH/100)
+					    tw= (237.7 * gama) / (17.271 - gama);		 //Tdew= (b * gama) / (a - gama)
+					    printf("%0.1f",tw);
+					}
 					break;
 
 				case 'c': // windchill temperature
-					windspeed=(float)(buffer[0x09])/10 * 3.6;        //in km/h
-					if (( windspeed > 4.8 ) && (temp < 10)) //formula from wikipedia only at condition
-                                        tw=13.12 + 0.6215 * temp - 11.37*pow(windspeed,0.16) + 0.3965*temp*pow(windspeed,0.16);
-					else tw=temp; 				//else nothing..
-					printf("%0.1f",tw);
+					if ((temp > 200) || (temp < -200) || (buffer[0x09] == 255)) printf("%s",errorstring); 
+					else
+					{
+					    windspeed=(float)(buffer[0x09])/10 * 3.6;	//in km/h
+					    //if (( windspeed > 4.8 ) && (temp < 10)) 	//formula from wikipedia only at condition
+                                    	    tw=13.12 + 0.6215 * temp - 11.37*pow(windspeed,0.16) + 0.3965*temp*pow(windspeed,0.16);
+					    //else tw=temp; 				//else nothing..
+					    if(temp<tw) tw=temp; //windchill can't be more than temp
+					    printf("%0.1f",tw);
+					}
 					break;
 				
 				case 'W': // wind speed
+					if ((temp > 200) || (temp < -200) || (buffer[0x09] == 255)) printf("%s",errorstring); else
 					printf("%0.1f",(float)(buffer[0x09])/10);
 					break;
 				
 				case 'G': // wind gust
+					if ((temp > 200) || (temp < -200) || (buffer[0x0A] == 255)) printf("%s",errorstring); else
 					printf("%0.1f",(float)(buffer[0x0A])/10);
 					break;
 				
@@ -473,14 +507,22 @@ int ws_print(char *format,uint8_t *buffer,uint8_t *buffer2,uint8_t *buffer3)
 					break;
 				
 				case 'P': // pressure
-					printf("%0.1f",(float)(buffer[0x07]+(buffer[0x08]<<8))/10);
+					if ((temp > 200) || (temp < -200)) printf("%s",errorstring); 
+					else
+					{
+					    printf("%0.1f",(float)(buffer[0x07]+(buffer[0x08]<<8))/10);
+					}
 					break;
 				
 				case 'p': // rel. pressure
-                                        p=(float)(buffer[0x07]+(buffer[0x08]<<8))/10; //abs. pressure
-					m=altitude / (18429.1 + 67.53 * temp + 0.003 * altitude); //power exponent to correction function
-					p=p * pow(10,m); //relative pressure * correction
-					printf("%0.1f",p);
+					if ((temp > 200) || (temp < -200)) printf("%s",errorstring); 
+					else
+					{
+                                    	    p=(float)(buffer[0x07]+(buffer[0x08]<<8))/10; //abs. pressure
+					    m=altitude / (18429.1 + 67.53 * temp + 0.003 * altitude); //power exponent to correction function
+					    p=p * pow(10,m); //relative pressure * correction
+					    printf("%0.1f",p);
+					}
 					break;
 				
 				case 'R': // rain total counter
