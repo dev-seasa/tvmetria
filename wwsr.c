@@ -1,10 +1,10 @@
 /*
  * wwsr - Wireless Weather Station Reader
  * 2007 dec 19, Michael Pendec (michael.pendec@gmail.com)
- * Version 0.5
+ *  Version 0.5
  * 2008 jan 24 Svend Skafte (svend@skafte.net)
  * 2008 sep 28 Adam Pribyl (covex@lowlevel.cz)
- * Modifications for different firmware version(?)
+ *  Modifications for different firmware version(?)
  * 2009 feb 1 Bradley Jarvis (bradley.jarvis@dcsi.net.au)
  *  major code cleanup
  *  update read to access device discretly
@@ -12,10 +12,21 @@
  *  added log function and fixed debug messaging
  * 2009 mar 28 Lukas Zvonar (lukic@mag-net.sk)
  *  added relative pressure formula (need to compile with -lm switch)
+ *  correct display of negative temperatures
  * 2009 apr 16 Petr Zitny (petr@zitny.net)
  *  added XML output (-x)
  *  fixed new line in help
- *  fixed negative temperature
+ * 2009 apr 17 Lukas Zvonar (lukic@mag-net.sk)
+ *  some code cleanup @ style work with format string
+ *  added possibility of changing log position of weather station (-p switch)
+ *  added 1h and 24h rainfall computation in mm/h
+    (and also i'm expecting possible error in owerflow of
+     address in weatherstation log when meteostation resets
+     it's log possition to "zero". This takes max 24h to
+     cleanup itself. To correct this, I need to know exact
+     min and max possition of weatherstation log)
+ * 2009 apr 20 Petr Zitny (petr@zitny.net)
+ *  
  */
 #include <stdio.h>
 #include <string.h>
@@ -29,19 +40,22 @@
 #define PACKAGE "wwsr"
 #define DEFAULT_VENDOR    0x1941
 #define DEFAULT_PRODUCT   0x8021
-#define DEFAULT_FORMAT    (char *)"time:                  %N\nin humidity:           %h %%\nout humidity:          %H %%\nin temperature:        %t C\nout temperature:       %T C\nout dew temperature:   %C C\nwindchill temperature: %c C\nwind speed:            %W m/s\nwind gust:             %G m/s\nwind direction:        %D\npressure:              %P hPa\nrel. pressure:         %p hPa\nrain:                  %R mm\n"
+#define DEFAULT_FORMAT    (char *)"time:                  %N\nin humidity:           %h %%\nout humidity:          %H %%\nin temperature:        %t C\nout temperature:       %T C\nout dew temperature:   %C C\nwindchill temperature: %c C\nwind speed:            %W m/s\nwind gust:             %G m/s\nwind direction:        %D\npressure:              %P hPa\nrel. pressure:         %p hPa\nrain last hour:        %r mm\nrain last 24h:         %F mm\nrain total:            %R mm\n"
 
 #define WS_CURRENT_ENTRY  30
+#define WS_MIN_ENTRY_ADDR 0x0100
+#define WS_MAX_ENTRY_ADDR 0xFFF0
 
 int ws_open(usb_dev_handle **dev,uint16_t vendor,uint16_t product);
 int ws_close(usb_dev_handle *dev);
 
 int ws_read(usb_dev_handle *dev,uint16_t address,uint8_t *data,uint16_t size);
 int ws_reset(usb_dev_handle *dev);
-int ws_print(char *format,uint8_t *buffer);
+int ws_print(char *format,uint8_t *buffer,uint8_t *buffer2,uint8_t *buffer3);
 int ws_dump(uint16_t address,uint8_t *buffer,uint16_t size,uint8_t width);
 
 int altitude=0;	//default altitude is sea level - change it if you need, or use -A parameter
+int position=0;	//default weather station log position - change it if you need, or use -p parameter
 
 typedef enum log_event
 {
@@ -62,17 +76,19 @@ int main(int argc, char **argv)
   int rv,c;
   uint16_t vendor,product;
   uint8_t help;
+  char* format=NULL;
   
   rv=0;
   dev=NULL;
   vendor=DEFAULT_VENDOR;
   product=DEFAULT_PRODUCT;
+  format=DEFAULT_FORMAT;
   help=0;
   
   _log_error=stderr;
   _log_info=stdout;
   
-	while (rv==0 && (c=getopt(argc,argv,"hf:v?d:a:A:x"))!=-1)
+	while (rv==0 && (c=getopt(argc,argv,"hf:v?d:a:A:p:x"))!=-1)
 	{
 		switch (c)
 		{
@@ -85,38 +101,29 @@ int main(int argc, char **argv)
 				sscanf(optarg,"%d",&altitude);
 				logger(LOG_DEBUG,"main","altitude set to %d",altitude);
 				break;
+
+			case 'p': // set altitude
+				sscanf(optarg,"%d",&position);
+				logger(LOG_DEBUG,"main","weather station log position set to %d",position);
+				break;
 			
 			case 'v': // Verbose messages
 				_log_debug=_log_warning=stdout;
 				logger(LOG_DEBUG,"main","Verbose messaging turned on");
 				break;
-				
+
 			case 'x': // XML export
 				optarg = "<data>\
+\n\t<timestamp>\n\t\t<data>%N</data>\n\t</timestamp>\
 \n\t<temp>\n\t\t<indoor>\n\t\t\t<data>%t</data>\n\t\t\t<unit>C</unit>\n\t\t</indoor>\n\t\t<outdoor>\n\t\t\t<data>%T</data>\n\t\t\t<unit>C</unit>\n\t\t</outdoor>\n\t\t<windchill>\n\t\t\t<data>%c</data>\n\t\t\t<unit>C</unit>\n\t\t</windchill>\n\t\t<dewpoint>\n\t\t\t<data>%C</data>\n\t\t\t<unit>C</unit>\n\t\t</dewpoint>\n\t</temp>\
 \n\t<wind>\n\t\t<speed>\n\t\t\t<data>%W</data>\n\t\t\t<unit>m/s</unit>\n\t\t</speed>\n\t\t<gust>\n\t\t\t<data>%G</data>\n\t\t\t<unit>m/s</unit>\n\t\t</gust>\n\t\t<direct>\n\t\t\t<data>%d</data>\n\t\t\t<unit>degrees</unit>\n\t\t</direct>\n\t\t<direct_str>\n\t\t\t<data>%D</data>\n\t\t\t<unit>Str</unit>\n\t\t</direct_str>\n\t</wind>\
 \n\t<pressure>\n\t\t<abs>\n\t\t\t<data>%P</data>\n\t\t\t<unit>hPa</unit>\n\t\t</abs>\n\t\t<rel>\n\t\t\t<data>%p</data>\n\t\t\t<unit>hPa</unit>\n\t\t</rel>\n\t</pressure>\
-\n\t<rain>\n\t\t<total>\n\t\t\t<data>%R</data>\n\t\t\t<unit>mm</unit>\n\t\t</total>\n\t</rain>\
+\n\t<rain>\n\t\t<hour>\n\t\t\t<data>%r</data>\n\t\t\t<unit>mm</unit>\n\t\t</hour>\n\t\t<day>\n\t\t\t<data>%F</data>\n\t\t\t<unit>mm</unit>\n\t\t</day>\n\t\t<total>\n\t\t\t<data>%R</data>\n\t\t\t<unit>mm</unit>\n\t\t</total>\n\t</rain>\
 \n\t<humidity>\n\t\t<indoor>\n\t\t\t<data>%h</data>\n\t\t\t<unit>%%</unit>\n\t\t</indoor>\n\t\t<outdoor>\n\t\t\t<data>%H</data>\n\t\t\t<unit>%%</unit>\n\t\t</outdoor>\n\t</humidity>\
 \n</data>\n";
-			
 			case 'f': // Format output
 				logger(LOG_DEBUG,"main","Format output using '%s'",optarg);
-				
-				if (dev==NULL)
-				{
-					rv=ws_open(&dev,vendor,product);
-				}
-				
-				if (dev)
-				{
-					uint16_t address;
-					uint8_t buffer[0x10];
-					
-					ws_read(dev,WS_CURRENT_ENTRY,(unsigned char *)&address,sizeof(address));
-					ws_read(dev,address,buffer,sizeof(buffer));
-					ws_print(optarg,buffer);
-				}
+				format=optarg;
 				break;
 			
 			case 'd': // Dump raw data from weather station
@@ -126,7 +133,7 @@ int main(int argc, char **argv)
 				a=0;
 				s=0x100;
 				w=16;
-				
+//				sscanf(optarg,"0x%X:0x%X",&a,&s);
 				if (sscanf(optarg,"0x%X:0x%X",&a,&s)<2)
 				if (sscanf(optarg,"0x%X:%u",&a,&s)<2)
 				if (sscanf(optarg,"%u:0x%X",&a,&s)<2)
@@ -170,8 +177,8 @@ int main(int argc, char **argv)
 				printf(" -? Display help\n");
 				printf(" -a v:p Change the vendor:product address of the usb device from the default\n");
 				printf(" -A <alt in m> Change altitude\n");
+				printf(" -p Alter position in weather station log from current position (can be +- value)\n");
 				printf(" -v Verbose output, enable debug and warning messages\n");
-				printf(" -x XML output\n");
 				printf(" -f Format output to user defined string\n");
 				printf("    %%h - inside humidity\n");
 				printf("    %%H - outside humidity\n");
@@ -182,25 +189,46 @@ int main(int argc, char **argv)
 				printf("    %%W - wind speed\n");
 				printf("    %%G - wind gust\n");
 				printf("    %%D - wind direction - named\n");
+				printf("    %%S - wind direction - slovak names\n");
 				printf("    %%d - wind direction - degrees\n");
 				printf("    %%P - pressure\n");
 				printf("    %%p - relative pressure\n");
-				printf("    %%R - rain\n");
+				printf("    %%r - rain 1h in mm/h\n");
+				printf("    %%f - rain 24h in mm/h\n");
+				printf("    %%F - rain last 24h in mm\n");
+				printf("    %%R - rain total from meteostation start in mm\n");
 				printf("    %%N - now - date/time string\n");
+                                printf(" -x XML output\n");
 				printf(" -d [address]:[length] Dump length bytes from address\n");
 		}
 	}
 	
 	if (rv==0 && dev==NULL && help==0)
 	{
-		uint16_t address;
+		uint16_t address,newposition,newposition1,newposition24; // current address in log, new address and new address -1h and - 24h (for rainfall computation)
 		uint8_t buffer[0x10];
+		uint8_t buffer2[0x10]; //30-60 min ago for 1h rainfall computation
+		uint8_t buffer3[0x10]; //1410-1440 min ago for 24h rainfall computation
 		
 		rv=ws_open(&dev,vendor,product);
 		
-		if (rv==0) rv=ws_read(dev,WS_CURRENT_ENTRY,(unsigned char *)&address,sizeof(address));
-		if (rv==0) rv=ws_read(dev,address,buffer,sizeof(buffer));
-		if (rv==0) rv=ws_print(DEFAULT_FORMAT,buffer);
+		if (rv==0) rv=ws_read(dev,WS_CURRENT_ENTRY,(unsigned char *)&address,sizeof(address));  //read current log address
+
+		newposition=address+(position*0x10);         //alter this address according to user parameter
+                newposition1=address+(position*0x10)-0x20;   //alter -1h address according to user parameter
+                newposition24=address+(position*0x10)-0x300; //alter -24h address according to user parameter
+
+                if ((newposition > WS_MAX_ENTRY_ADDR) || (newposition < WS_MIN_ENTRY_ADDR))     //check for buffer owerflow
+                          {newposition=(newposition && 0xFFFF) + WS_MIN_ENTRY_ADDR; }
+                if ((newposition1 > WS_MAX_ENTRY_ADDR) || (newposition1 < WS_MIN_ENTRY_ADDR))   //check for buffer owerflow
+                          {newposition1=(newposition1 && 0xFFFF) + WS_MIN_ENTRY_ADDR; }
+                if ((newposition24 > WS_MAX_ENTRY_ADDR) || (newposition24 < WS_MIN_ENTRY_ADDR)) //check for buffer owerflow
+                          {newposition24=(newposition24 && 0xFFFF) + WS_MIN_ENTRY_ADDR; }
+
+		if (rv==0) rv=ws_read(dev,newposition,buffer,sizeof(buffer));        //read current position
+		if (rv==0) rv=ws_read(dev,newposition1,buffer2,sizeof(buffer));      //read -1h buffer (in real 30-59 min ago)
+		if (rv==0) rv=ws_read(dev,newposition24,buffer3,sizeof(buffer));     //read -24h buffer (in real 23,5-24 h ago)
+		if (rv==0) rv=ws_print(format,buffer,buffer2,buffer3);
 	}
 	
 	if (dev)
@@ -357,7 +385,7 @@ int ws_reset(usb_dev_handle *dev)
 	return 0;
 }
 
-int ws_print(char *format,uint8_t *buffer)
+int ws_print(char *format,uint8_t *buffer,uint8_t *buffer2,uint8_t *buffer3)
 {
         char *dir[]=
         {
@@ -369,12 +397,22 @@ int ws_print(char *format,uint8_t *buffer)
                 "0","23","45","68","90","113","135","158",
                 "180","203","225","248","270","293","315","338"
         };
-/*	char *dirslovak[]=		{"S","SSV","SV","VSV","V","VJV","JV","JJV",
+	char *dirslovak[]=		{"S","SSV","SV","VSV","V","VJV","JV","JJV",
                 	                 "J","JJZ","JZ","ZJZ","Z","ZSZ","SZ","SSZ"};	
-*/
+
         time_t basictime;
         char datestring[50];  
-        float p,temp,m,windspeed,tw,hum,gama;
+        float p,temp,m,windspeed,tw,hum,gama,rf,rf2;
+	short tempi,tempo;
+
+        if (buffer[0x06] >= 0x80) tempo=buffer[0x05]+(buffer[0x06]<<8) ^ 0x7FFF;   //weather station uses top bit for sign and not normal
+                          else    tempo=buffer[0x05]+(buffer[0x06]<<8) ^ 0x0000;   //signed short, so we need to correct this with xor
+        if (buffer[0x03] >= 0x80) tempi=buffer[0x02]+(buffer[0x03]<<8) ^ 0x7FFF;   //we need to do the same correction to indoor temp
+                          else    tempi=buffer[0x02]+(buffer[0x03]<<8) ^ 0x0000;   //
+        temp=(float)(tempo)/10;		//outdoor temp for computing Tdew, Windchill and Rel.pressure
+
+//        if (abs(temp) > 10000) {printf("err"); *format=(char)""; }	//if temp is over +-1000 �C, we lost connection to outdoor unit, so write error
+
 
 	for (;*format;format++)
 	{
@@ -391,23 +429,14 @@ int ws_print(char *format,uint8_t *buffer)
 					break;
 				
 				case 't': // inside temperature
-					if ((buffer[0x03] & 128) > 0) { //fix negative temperature
-					    printf("-%0.1f",(float)((buffer[0x02]+(buffer[0x03]<<8))& 32767)/10);
-					} else {
-					    printf("%0.1f",(float)((buffer[0x02]+(buffer[0x03]<<8))& 32767)/10);
-					};	
+					printf("%0.1f",(float)(tempi)/10);
 					break;
 				
 				case 'T': // outside temperature
-					if ((buffer[0x06] & 128) > 0) { //fix negative temperature
-					    printf("-%0.1f",(float)((buffer[0x05]+(buffer[0x06]<<8))& 32767)/10);
-					} else {
-					    printf("%0.1f",(float)((buffer[0x05]+(buffer[0x06]<<8))& 32767)/10);
-					};
-					break;	
+					printf("%0.1f",temp);
+					break;
 
 				case 'C': // dew point based on outside temperature (formula from wikipedia)
-                                        temp=(float)(buffer[0x05]+(buffer[0x06]<<8))/10; //out temp celsius
 					hum=(float)buffer[0x04]/100; 			 //humidity / 100
 					if (hum == 0) hum=0.001;			 //in case of 0% humidity
 					gama=(17.271*temp)/(237.7+temp) + log (hum);	 //gama=aT/(b+T) + ln (RH/100)
@@ -416,7 +445,6 @@ int ws_print(char *format,uint8_t *buffer)
 					break;
 
 				case 'c': // windchill temperature
-                                        temp=(float)(buffer[0x05]+(buffer[0x06]<<8))/10; //out temp celsius
 					windspeed=(float)(buffer[0x09])/10 * 3.6;        //in km/h
 					if (( windspeed > 4.8 ) && (temp < 10)) //formula from wikipedia only at condition
                                         tw=13.12 + 0.6215 * temp - 11.37*pow(windspeed,0.16) + 0.3965*temp*pow(windspeed,0.16);
@@ -436,6 +464,10 @@ int ws_print(char *format,uint8_t *buffer)
 					printf(dir[buffer[0x0C]<sizeof(dir)/sizeof(dir[0])?buffer[0x0C]:0]);
 					break;
 
+				case 'S': // wind direction - named Slovak
+					printf(dirslovak[buffer[0x0C]<sizeof(dir)/sizeof(dir[0])?buffer[0x0C]:0]);
+					break;
+
 				case 'd': // wind direction - degrees
 					printf(dirdeg[buffer[0x0C]<sizeof(dir)/sizeof(dir[0])?buffer[0x0C]:0]);
 					break;
@@ -446,20 +478,43 @@ int ws_print(char *format,uint8_t *buffer)
 				
 				case 'p': // rel. pressure
                                         p=(float)(buffer[0x07]+(buffer[0x08]<<8))/10; //abs. pressure
-					temp=(float)(buffer[0x05]+(buffer[0x06]<<8))/10; //out temp
 					m=altitude / (18429.1 + 67.53 * temp + 0.003 * altitude); //power exponent to correction function
 					p=p * pow(10,m); //relative pressure * correction
 					printf("%0.1f",p);
 					break;
 				
-				case 'R': // rain
+				case 'R': // rain total counter
 					printf("%0.1f",(float)(buffer[0x0D]+(buffer[0x0E]<<8))*0.3);
+					break;
+				case 'r': // rain 1h in mm/h
+                                        rf=(float)(buffer[0x0D]+(buffer[0x0E]<<8));	//current rainfall total - 
+                                        rf2=(float)(buffer2[0x0D]+(buffer2[0x0E]<<8));	//prev.last saved rainfall total
+					if ((rf-rf2) < 0) { rf=0; rf2=0;}               //if something is wrong..
+					if (rf2 >= 65000) { rf=0; rf2=0;}               //if something is wrong..
+					printf("%0.1f",(rf-rf2)*0.3*60/(30+buffer[0x00]));	//current-last/time (30-59 min)
+					break;
+
+				case 'f': // rain 24h in mm/h
+                                        rf=(float)(buffer[0x0D]+(buffer[0x0E]<<8));	//current rainfall total - 
+                                        rf2=(float)(buffer3[0x0D]+(buffer3[0x0E]<<8));	//-24h saved rainfall total
+					if ((rf-rf2) < 0) { rf=0; rf2=0;}               //if something is wrong..
+					if (rf2 >= 65000) { rf=0; rf2=0;}               //if something is wrong..
+					printf("%0.1f",(rf-rf2)*0.3*60/(30*47+buffer[0x00]));	//current-last/time 
+					break;
+
+				case 'F': // rain 24h in mm
+                                        rf=(float)(buffer[0x0D]+(buffer[0x0E]<<8));	//current rainfall total - 
+                                        rf2=(float)(buffer3[0x0D]+(buffer3[0x0E]<<8));	//-24h saved rainfall total
+					if ((rf-rf2) < 0) { rf=0; rf2=0;}               //if something is wrong..
+					if (rf2 >= 65000) { rf=0; rf2=0;}               //if something is wrong..
+					printf("%0.1f",(rf-rf2)*0.3);		//current-last/time
 					break;
 
 				case 'N': // date
 				        time(&basictime);
+                                        basictime=basictime+position*30*60;
 				        strftime(datestring,sizeof(datestring),"%Y-%m-%d %H:%M:%S",
-			                 localtime(&basictime));
+			                 localtime(&basictime));  //neeeeeeeeeeeeeeeeed to alter if -p param is applied
 				        // Print out and leave
 				        printf("%s",datestring);
 					break;
@@ -491,13 +546,6 @@ int ws_print(char *format,uint8_t *buffer)
 			printf("%c",*format);
 		}
 	}
-/*	printf("rain?:           %0.1f (this is always zero)\n",(float)(buffer[253])/10);
-	printf("rain:            %0.1f (24h?)\n",(float)(buffer[254]+(buffer[255]<<8))/10);
-	printf("rain1:           %d\n",buffer[254]);
-	printf("rain2:           %d\n",buffer[253]);
-	printf("other 1:         %d\n",buffer[251]);
-	printf("other 2:         %d\n",buffer[255]);
-	printf("\n");*/
 	
 	return 0;
 }
