@@ -5,582 +5,576 @@
  * 2008 jan 24 Svend Skafte (svend@skafte.net)
  * 2008 sep 28 Adam Pribyl (covex@lowlevel.cz)
  * Modifications for different firmware version(?)
+ * 2009 feb 1 Bradley Jarvis (bradley.jarvis@dcsi.net.au)
+ *  major code cleanup
+ *  update read to access device discretly
+ *  added user formatted output
+ *  added log function and fixed debug messaging
+ * 2009 mar 28 Lukas Zvonar (lukic@mag-net.sk)
+ *  added relative pressure formula (need to compile with -lm switch)
+ * 2009 apr 16 Petr Zitny (petr@zitny.net)
+ *  added XML output (-x)
+ *  fixed new line in help
+ *  fixed negative temperature
  */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
-#include <signal.h>
-#include <ctype.h>
+#include <stdarg.h>
 #include <usb.h>
+#include <time.h>
+#include <math.h>
 
-struct usb_dev_handle *devh;
-int	ret,mempos=0,showall=0,shownone=0,resetws=0,pdebug=0,postprocess=0,showJSON=0;
-int	o1,o2,o3,o4,o5,o6,o7,o8,o9,o10,o11,o12,o13,o14,o15;
-char	buf[1000],*endptr;
-char	buf2[400];
+#define PACKAGE "wwsr"
+#define DEFAULT_VENDOR    0x1941
+#define DEFAULT_PRODUCT   0x8021
+#define DEFAULT_FORMAT    (char *)"time:                  %N\nin humidity:           %h %%\nout humidity:          %H %%\nin temperature:        %t C\nout temperature:       %T C\nout dew temperature:   %C C\nwindchill temperature: %c C\nwind speed:            %W m/s\nwind gust:             %G m/s\nwind direction:        %D\npressure:              %P hPa\nrel. pressure:         %p hPa\nrain:                  %R mm\n"
 
-void _close_readw() {
-    ret = usb_release_interface(devh, 0);
-    if (ret!=0) printf("could not release interface: %d\n", ret);
-    ret = usb_close(devh);
-    if (ret!=0) printf("Error closing interface: %d\n", ret);
-}
+#define WS_CURRENT_ENTRY  30
 
-struct usb_device *find_device(int vendor, int product) {
-    struct usb_bus *bus;
-    
-    for (bus = usb_get_busses(); bus; bus = bus->next) {
-	struct usb_device *dev;
-	
-	for (dev = bus->devices; dev; dev = dev->next) {
-	    if (dev->descriptor.idVendor == vendor
-		&& dev->descriptor.idProduct == product)
-		return dev;
-	}
-    }
-    return NULL;
-}
+int ws_open(usb_dev_handle **dev,uint16_t vendor,uint16_t product);
+int ws_close(usb_dev_handle *dev);
 
-struct tempstat {
-	char ebuf[271];
-	unsigned short  noffset;
-	char delay1;
-	char hindoor;
-	signed int tindoor;
-	unsigned char houtdoor;
-	signed int toutdoor;
-	unsigned char swind;
-	unsigned char swind2;
-	unsigned char tempf;
-	int pressure;
-	unsigned char temph;
-	unsigned char tempi;
-	signed int rain;
-	signed int rain2;
-	unsigned char rain1;
-	unsigned char oth1;
-	unsigned char oth2;
-	char nbuf[250];
-	char winddirection[100];
-} buf4;
+int ws_read(usb_dev_handle *dev,uint16_t address,uint8_t *data,uint16_t size);
+int ws_reset(usb_dev_handle *dev);
+int ws_print(char *format,uint8_t *buffer);
+int ws_dump(uint16_t address,uint8_t *buffer,uint16_t size,uint8_t width);
 
+int altitude=0;	//default altitude is sea level - change it if you need, or use -A parameter
 
-void print_bytes(char *bytes, int len) {
-    int i;
-    if (len > 0) {
-	for (i=0; i<len; i++) {
-	    printf("%02x ", (int)((unsigned char)bytes[i]));
-	}
-	// printf("\"");
-    }
-}
-void _open_readw() {
-    struct usb_device *dev;
-    int vendor, product;
-#if 0
-    usb_urb *isourb;
-    struct timeval isotv;
-    char isobuf[32768];
-#endif
-
-    usb_init();
-//    usb_set_debug(0);
-    usb_find_busses();
-    usb_find_devices();
-
-    vendor = 0x1941;
-    product = 0x8021; 
-
-    dev = find_device(vendor, product);
-    assert(dev);
-    devh = usb_open(dev);
-    assert(devh);
-    signal(SIGTERM, _close_readw);
-    ret = usb_get_driver_np(devh, 0, buf, sizeof(buf));
-    if (ret == 0) {
-	// printf("interface 0 already claimed by driver \"%s\", attempting to detach it\n", buf);
-	ret = usb_detach_kernel_driver_np(devh, 0);
-	// printf("usb_detach_kernel_driver_np returned %d\n", ret);
-    }
-    ret = usb_claim_interface(devh, 0);
-    if (ret != 0) {
-	printf("Could not open usb device, errorcode - %d\n", ret);
-	exit(1);
-    }
-    ret = usb_set_altinterface(devh, 0);
-    assert(ret >= 0);
-}
-
-
-void _init_wread() {
-	char tbuf[1000];
-	ret = usb_get_descriptor(devh, 1, 0, tbuf, 0x12);
-	// usleep(14*1000);
-	ret = usb_get_descriptor(devh, 2, 0, tbuf, 9);
-	// usleep(10*1000);
-	ret = usb_get_descriptor(devh, 2, 0, tbuf, 0x22);
-	// usleep(22*1000);
-	ret = usb_release_interface(devh, 0);
-	if (ret != 0) printf("failed to release interface before set_configuration: %d\n", ret);
-	ret = usb_set_configuration(devh, 1);
-	ret = usb_claim_interface(devh, 0);
-	if (ret != 0) printf("claim after set_configuration failed with error %d\n", ret);
-	ret = usb_set_altinterface(devh, 0);
-	// usleep(22*1000);
-	ret = usb_control_msg(devh, USB_TYPE_CLASS + USB_RECIP_INTERFACE, 0xa, 0, 0, tbuf, 0, 1000);
-	// usleep(4*1000);
-	ret = usb_get_descriptor(devh, 0x22, 0, tbuf, 0x74);
-}
-
-void _send_usb_msg( char msg1[1],char msg2[1],char msg3[1],char msg4[1],char msg5[1],char msg6[1],char msg7[1],char msg8[1] ) {
-	char tbuf[1000];
-	tbuf[0] = msg1[0];
-	tbuf[1] = msg2[0];
-	tbuf[2] = msg3[0];
-	tbuf[3] = msg4[0];
-	tbuf[4] = msg5[0];
-	tbuf[5] = msg6[0];
-	tbuf[6] = msg7[0];
-	tbuf[7] = msg8[0];
-	// print_bytes(tbuf, 8);
-	// printf(" - - - \n");
-	ret = usb_control_msg(devh, USB_TYPE_CLASS + USB_RECIP_INTERFACE, 9, 0x200, 0, tbuf, 8, 1000);
-	// usleep(28*1000);
-}
-
-void _read_usb_msg(char *buffer) {
-   char tbuf[1000];
-   usb_interrupt_read(devh, 0x81, tbuf, 0x20, 1000);
-   memcpy(buffer, tbuf, 0x20);
-   // usleep(82*1000);
-}
-
-
-void read_arguments(int argc, char **argv) {
-	int c,pinfo=0;
-	char *mempos1=0,*endptr;
-  	shownone=0;
-  	o1=0;
-	while ((c = getopt (argc, argv, "akwosiurthJp:zyx")) != -1)
-	{
-         switch (c)
-           {
-           case 'a':
-  	     showall=1;
-	     shownone=1;
-             break;
-           case 'i':
-  	     o1=1;
-	     shownone=1;
-             break;
-           case 'u':
-  	     o2=1;
-	     shownone=1;
-             break;
-           case 't':
-  	     o3=1;
-	     shownone=1;
-             break;
-           case 'w':
-  	     o4=1;
-	     shownone=1;
-             break;
-           case 'r':
-  	     o5=1;
-	     shownone=1;
-             break;
-           case 'o':
-  	     o6=1;
-	     shownone=1;
-             break;
-           case 's':
-  	     o7=1;
-	     shownone=1;
-             break;
-           case 'j':
-  	     o9=1;
-	     shownone=1;
-             break;
-           case 'p':
-  	     mempos1=optarg;
-             break;
-           case 'h':
-  	     pinfo=1;
-             break;
-           case 'x':
-  	     pdebug=1;
-             break;
-           case 'y':
-             postprocess=1;
-             shownone=1;
-             break;
-           case 'z':
-  	     resetws=1;
-	     shownone=1;
-             break;
-	   case 'J':
-	     showJSON=1;
-	     shownone=1;
-	     break;
-           case '?':
-             if (isprint (optopt))
-               fprintf (stderr, "Unknown option `-%c'.\n", optopt);
-             else
-               fprintf (stderr,"Unknown option character `\\x%x'.\n",optopt);
-           default:
-             abort ();
-           }
-	}
-	if ( (pinfo!=0) | (shownone==0) ) {
-		printf("Wireless Weather Station Reader v0.1\n");
-		printf("(C) 2007 Michael Pendec\n\n");
-		printf("options\n");
-		printf(" -h	help information\n");
-		printf(" -p	Start at offset (can be used together with below parameters\n");
-		printf(" -x	Show bytes retrieved from device\n");
-		printf(" -z	Reset log buffer (will ask for confirmation.\n\n");
-		printf(" -a	Show all stats (overrides below parameters)\n");
-		printf(" -s	Show current history position\n");
-		printf(" -t	Show temperature\n");
-		printf(" -j	Show Pressure (hPa)\n");
-		printf(" -u	Show humidity\n");
-		printf(" -r	Show rain\n");
-		printf(" -w	Show wind\n");
-		printf(" -o	other \n\n");
-		printf(" -J     Show JSON\n");
-		exit(0);
-	}
-	if (mempos1!=0) {
-	    	mempos = strtol(mempos1, &endptr, 16);
-	} else {
-	        if ( !showJSON) printf("Reading last updated record from device\n");
-	}
-}
-
-int main(int argc, char **argv) {
-    int		buftemp;
-    char ec='n';
-    struct tempstat buf5;
-
-    read_arguments(argc,argv);
-    _open_readw();
-   _init_wread();
-
-   if (resetws==1) {
-     printf(" Resetting WetterStation history\n");
-     printf("Sure you want to reset wetter station (y/N)?");
-     fflush(stdin);
-     scanf("%c",&ec);
-     if ( (ec=='y') || (ec=='Y') ) {
-   	_send_usb_msg("\xa0","\x00","\x00","\x20","\xa0","\x00","\x00","\x20");
-    	_send_usb_msg("\x55","\x55","\xaa","\xff","\xff","\xff","\xff","\xff");
-	usleep(28*1000);
-     	_send_usb_msg("\xff","\xff","\xff","\xff","\xff","\xff","\xff","\xff");
-	usleep(28*1000);
-     	_send_usb_msg("\x05","\x20","\x01","\x38","\x11","\x00","\x00","\x00");
-	usleep(28*1000);
-    	_send_usb_msg("\x00","\x00","\xaa","\x00","\x00","\x00","\x20","\x3e");
-	usleep(28*1000);
-     } else {
-     	printf(" Aborted reset of history buffer\n");
-     }
-     _close_readw();
-     return 0;
-   }
-   _send_usb_msg("\xa1","\x00","\x00","\x20","\xa1","\x00","\x00","\x20");
-   _read_usb_msg(buf2);
-   if ( ( pdebug==1) ) 
-   {
-      printf("000-031: ");
-      print_bytes(buf2, 32);
-      printf("\n");
-   }
-   _send_usb_msg("\xa1","\x00","\x20","\x20","\xa1","\x00","\x20","\x20");
-   _read_usb_msg(buf2+32);
-   if ( ( pdebug==1) ) 
-   {
-      printf("032-063: ");
-      print_bytes(buf2+32, 32);
-      printf("\n");
-   }
-   _send_usb_msg("\xa1","\x00","\x40","\x20","\xa1","\x00","\x40","\x20");
-   _read_usb_msg(buf2+64);
-   if ( ( pdebug==1) ) 
-   {
-      printf("064-095: ");
-      print_bytes(buf2+64, 32);
-      printf("\n");
-   }
-   _send_usb_msg("\xa1","\x00","\x60","\x20","\xa1","\x00","\x60","\x20");
-   _read_usb_msg(buf2+96);
-   if ( ( pdebug==1) ) 
-   {
-      printf("096-123: ");
-      print_bytes(buf2+96, 32);
-      printf("\n");
-   }
-   _send_usb_msg("\xa1","\x00","\x80","\x20","\xa1","\x00","\x80","\x20");
-   _read_usb_msg(buf2+128);
-   if ( ( pdebug==1) ) 
-   {
-      printf("124-159: ");
-      print_bytes(buf2+128, 32);
-      printf("\n");
-   }
-   _send_usb_msg("\xa1","\x00","\xa0","\x20","\xa1","\x00","\xa0","\x20");
-   _read_usb_msg(buf2+160);
-   if ( ( pdebug==1) ) 
-   {
-      printf("160-191: ");
-      print_bytes(buf2+160, 32);
-      printf("\n");
-   }
-   _send_usb_msg("\xa1","\x00","\xc0","\x20","\xa1","\x00","\xc0","\x20");
-   _read_usb_msg(buf2+192);
-   if ( ( pdebug==1) ) 
-   {
-      printf("192-223: ");
-      print_bytes(buf2+192, 32);
-      printf("\n");
-   }
-   _send_usb_msg("\xa1","\x00","\xe0","\x20","\xa1","\x00","\xe0","\x20");
-   _read_usb_msg(buf2+224);
-   if ( ( pdebug==1) ) 
-   {
-      printf("224-255: ");
-      print_bytes(buf2+224, 32);
-      printf("\n");
-   }
-
-
- //  buf4.noffset = (unsigned char) buf2[22] + ( 256 * buf2[23] );
-   buf4.noffset = (unsigned char) buf2[30] + ( 256 * buf2[31] );
-   if (mempos!=0) buf4.noffset = mempos;
-   buftemp = 0;
-   if (buf4.noffset!=0) buftemp = buf4.noffset - 0x10;
-   buf[1] = ( buftemp >>8 & 0xFF ) ;
-   buf[2] = buftemp & 0xFF;
-   buf[3] = ( buftemp >>8 & 0xFF ) ;
-   buf[4] = buftemp & 0xFF;
-   _send_usb_msg("\xa1",buf+1,buf+2,"\x20","\xa1",buf+3,buf+4,"\x20");
-   _read_usb_msg(buf2+224);
-   if ( ( pdebug==1) ) 
-   {
-      printf("224-255: ");
-      print_bytes(buf2+224, 32);
-      printf("\n");
-   }
-
-ret = usb_control_msg(devh, USB_TYPE_CLASS + USB_RECIP_INTERFACE, 0x0000009, 0x0000200, 0x0000000, buf, 0x0000008, 1000);
-// usleep(8*1000);
-ret = usb_interrupt_read(devh, 0x00000081, buf, 0x0000020, 1000);
-memcpy(buf2+256, buf, 0x0000020);
-if ( ( pdebug==1) )
+typedef enum log_event
 {
-   printf("256-287: ");
-   print_bytes(buf2+256, 32);
-   printf("\n");
+	LOG_DEBUG=1,
+	LOG_WARNING=2,
+	LOG_ERROR=4,
+	LOG_INFO=8
+} log_event;
+FILE *_log_debug=NULL,*_log_warning=NULL,*_log_error=NULL,*_log_info=NULL;
+
+void logger(log_event event,char *function,char *msg,...);
+
+
+
+int main(int argc, char **argv)
+{
+	usb_dev_handle *dev;
+  int rv,c;
+  uint16_t vendor,product;
+  uint8_t help;
+  
+  rv=0;
+  dev=NULL;
+  vendor=DEFAULT_VENDOR;
+  product=DEFAULT_PRODUCT;
+  help=0;
+  
+  _log_error=stderr;
+  _log_info=stdout;
+  
+	while (rv==0 && (c=getopt(argc,argv,"hf:v?d:a:A:x"))!=-1)
+	{
+		switch (c)
+		{
+			case 'a': // set device id
+				sscanf(optarg,"%X:%X",&vendor,&product);
+				logger(LOG_DEBUG,"main","USB device set to vendor=%04X product=%04X",vendor,product);
+				break;
+
+			case 'A': // set altitude
+				sscanf(optarg,"%d",&altitude);
+				logger(LOG_DEBUG,"main","altitude set to %d",altitude);
+				break;
+			
+			case 'v': // Verbose messages
+				_log_debug=_log_warning=stdout;
+				logger(LOG_DEBUG,"main","Verbose messaging turned on");
+				break;
+				
+			case 'x': // XML export
+				optarg = "<data>\
+\n\t<temp>\n\t\t<indoor>\n\t\t\t<data>%t</data>\n\t\t\t<unit>C</unit>\n\t\t</indoor>\n\t\t<outdoor>\n\t\t\t<data>%T</data>\n\t\t\t<unit>C</unit>\n\t\t</outdoor>\n\t\t<windchill>\n\t\t\t<data>%c</data>\n\t\t\t<unit>C</unit>\n\t\t</windchill>\n\t\t<dewpoint>\n\t\t\t<data>%C</data>\n\t\t\t<unit>C</unit>\n\t\t</dewpoint>\n\t</temp>\
+\n\t<wind>\n\t\t<speed>\n\t\t\t<data>%W</data>\n\t\t\t<unit>m/s</unit>\n\t\t</speed>\n\t\t<gust>\n\t\t\t<data>%G</data>\n\t\t\t<unit>m/s</unit>\n\t\t</gust>\n\t\t<direct>\n\t\t\t<data>%d</data>\n\t\t\t<unit>degrees</unit>\n\t\t</direct>\n\t\t<direct_str>\n\t\t\t<data>%D</data>\n\t\t\t<unit>Str</unit>\n\t\t</direct_str>\n\t</wind>\
+\n\t<pressure>\n\t\t<abs>\n\t\t\t<data>%P</data>\n\t\t\t<unit>hPa</unit>\n\t\t</abs>\n\t\t<rel>\n\t\t\t<data>%p</data>\n\t\t\t<unit>hPa</unit>\n\t\t</rel>\n\t</pressure>\
+\n\t<rain>\n\t\t<total>\n\t\t\t<data>%R</data>\n\t\t\t<unit>mm</unit>\n\t\t</total>\n\t</rain>\
+\n\t<humidity>\n\t\t<indoor>\n\t\t\t<data>%h</data>\n\t\t\t<unit>%%</unit>\n\t\t</indoor>\n\t\t<outdoor>\n\t\t\t<data>%H</data>\n\t\t\t<unit>%%</unit>\n\t\t</outdoor>\n\t</humidity>\
+\n</data>\n";
+			
+			case 'f': // Format output
+				logger(LOG_DEBUG,"main","Format output using '%s'",optarg);
+				
+				if (dev==NULL)
+				{
+					rv=ws_open(&dev,vendor,product);
+				}
+				
+				if (dev)
+				{
+					uint16_t address;
+					uint8_t buffer[0x10];
+					
+					ws_read(dev,WS_CURRENT_ENTRY,(unsigned char *)&address,sizeof(address));
+					ws_read(dev,address,buffer,sizeof(buffer));
+					ws_print(optarg,buffer);
+				}
+				break;
+			
+			case 'd': // Dump raw data from weather station
+			{
+				uint16_t a,s,w;
+				
+				a=0;
+				s=0x100;
+				w=16;
+				
+				if (sscanf(optarg,"0x%X:0x%X",&a,&s)<2)
+				if (sscanf(optarg,"0x%X:%u",&a,&s)<2)
+				if (sscanf(optarg,"%u:0x%X",&a,&s)<2)
+				if (sscanf(optarg,"%u:%u",&a,&s)<2)
+				if (sscanf(optarg,":0x%X",&s)<1)
+					sscanf(optarg,":%u",&s);
+				
+				logger(LOG_DEBUG,"main","Dump options address=%u size=%u",a,s);
+				
+				if (dev==NULL)
+				{
+					rv=ws_open(&dev,vendor,product);
+				}
+				
+				if (dev)
+				{
+					uint8_t *b;
+					
+					logger(LOG_DEBUG,"main","Allocating %u bytes for read buffer",s);
+					b=malloc(s);
+					if (!b) logger(LOG_ERROR,"main","Could not allocate %u bytes for read buffer",s);
+					
+					if (b)
+					{
+						logger(LOG_DEBUG,"main","Allocated %u bytes for read buffer",s);
+						
+						ws_read(dev,a,b,s);
+						ws_dump(a,b,s,w);
+						
+						free(b);
+					}
+				}
+				break;
+			}
+			
+			case '?':
+				help=1;
+				printf("Wireless Weather Station Reader v0.1\n");
+				printf("(C) 2007 Michael Pendec\n\n");
+				printf("options\n");
+				printf(" -? Display help\n");
+				printf(" -a v:p Change the vendor:product address of the usb device from the default\n");
+				printf(" -A <alt in m> Change altitude\n");
+				printf(" -v Verbose output, enable debug and warning messages\n");
+				printf(" -x XML output\n");
+				printf(" -f Format output to user defined string\n");
+				printf("    %%h - inside humidity\n");
+				printf("    %%H - outside humidity\n");
+				printf("    %%t - inside temperature\n");
+				printf("    %%T - outside temperature\n");
+				printf("    %%C - outside dew temperature\n");
+				printf("    %%c - outside wind chill temperature\n");
+				printf("    %%W - wind speed\n");
+				printf("    %%G - wind gust\n");
+				printf("    %%D - wind direction - named\n");
+				printf("    %%d - wind direction - degrees\n");
+				printf("    %%P - pressure\n");
+				printf("    %%p - relative pressure\n");
+				printf("    %%R - rain\n");
+				printf("    %%N - now - date/time string\n");
+				printf(" -d [address]:[length] Dump length bytes from address\n");
+		}
+	}
+	
+	if (rv==0 && dev==NULL && help==0)
+	{
+		uint16_t address;
+		uint8_t buffer[0x10];
+		
+		rv=ws_open(&dev,vendor,product);
+		
+		if (rv==0) rv=ws_read(dev,WS_CURRENT_ENTRY,(unsigned char *)&address,sizeof(address));
+		if (rv==0) rv=ws_read(dev,address,buffer,sizeof(buffer));
+		if (rv==0) rv=ws_print(DEFAULT_FORMAT,buffer);
+	}
+	
+	if (dev)
+	{
+		ws_close(dev);
+	}
+	
+	return rv;
 }
 
-buf4.delay1 = buf2[224];
-buf4.tempi=buf2[236];
-	if (buf4.tempi==0) strcpy(buf4.winddirection,"N");
-	if (buf4.tempi==1) strcpy(buf4.winddirection,"NNE");
-	if (buf4.tempi==2) strcpy(buf4.winddirection,"NE");
-	if (buf4.tempi==3) strcpy(buf4.winddirection,"ENE");
-	if (buf4.tempi==4) strcpy(buf4.winddirection,"E");
-	if (buf4.tempi==5) strcpy(buf4.winddirection,"ESE");
-	if (buf4.tempi==6) strcpy(buf4.winddirection,"SE");
-	if (buf4.tempi==7) strcpy(buf4.winddirection,"SSE");
-	if (buf4.tempi==8) strcpy(buf4.winddirection,"S");
-	if (buf4.tempi==9) strcpy(buf4.winddirection,"SSW");
-	if (buf4.tempi==10) strcpy(buf4.winddirection,"SW");
-	if (buf4.tempi==11) strcpy(buf4.winddirection,"WSW");
-	if (buf4.tempi==12) strcpy(buf4.winddirection,"W");
-	if (buf4.tempi==13) strcpy(buf4.winddirection,"WNW");
-	if (buf4.tempi==14) strcpy(buf4.winddirection,"NW");
-	if (buf4.tempi==15) strcpy(buf4.winddirection,"NNW");
-buf4.hindoor = buf2[225];
-buf4.tindoor =( (unsigned char) buf2[226] + (unsigned char) buf2[227] *256);
-buf4.houtdoor = buf2[228];
-buf4.toutdoor =( (unsigned char) buf2[229] + (unsigned char) buf2[230] *256);
-buf4.pressure = (unsigned char) buf2[231] + ( 256*buf2[232]);
-buf4.swind = buf2[233];
-buf4.swind2 = buf2[234];
-buf4.oth1  = buf2[235];
-buf4.rain2 = (unsigned char) buf2[237];
-buf4.rain =( (unsigned char) buf2[238] + (unsigned char) buf2[239] *256);
-buf4.rain1 = buf2[238];
-buf4.oth2 = buf2[239];
+int ws_open(usb_dev_handle **dev,uint16_t vendor,uint16_t product)
+{
+	int rv;
+	struct usb_bus *bus;
+	
+	rv=0;
+	*dev=NULL;
+	
+	logger(LOG_DEBUG,"ws_open","Initialise usb");
+	usb_init();
+	usb_set_debug(0);
+	usb_find_busses();
+	usb_find_devices();
+	
+	logger(LOG_DEBUG,"ws_open","Scan for device %04X:%04X",vendor,product);
+	for (bus=usb_get_busses(); bus && *dev==NULL; bus=bus->next)
+	{
+		struct usb_device *device;
+		
+		for (device=bus->devices; device && *dev==NULL; device=device->next)
+		{
+			if (device->descriptor.idVendor == vendor
+				&& device->descriptor.idProduct == product)
+			{
+				logger(LOG_DEBUG,"ws_open","Found device %04X:%04X",vendor,product);
+				*dev=usb_open(device);
+			}
+		}
+	}
+	
+	if (rv==0 && *dev)
+	{
+		char buf[100];
+		
+		switch (usb_get_driver_np(*dev,0,buf,sizeof(buf)))
+		{
+			case 0:
+				logger(LOG_WARNING,"ws_open","Interface 0 already claimed by driver \"%s\", attempting to detach it", buf);
+				rv=usb_detach_kernel_driver_np(*dev,0);
+		}
+		
+		if (rv==0)
+		{
+			logger(LOG_DEBUG,"ws_open","Claim device");
+			rv=usb_claim_interface(*dev,0);
+		}
+		
+		if (rv==0)
+		{
+			logger(LOG_DEBUG,"ws_open","Set alt interface");
+			rv=usb_set_altinterface(*dev,0);
+		}
+	}
+	else
+	{
+		logger(LOG_ERROR,"ws_open","Device %04X:%04X not found",vendor,product);
+		rv=1;
+	}
+	
+	if (rv==0)
+	{
+		logger(LOG_DEBUG,"ws_open","Device %04X:%04X opened",vendor,product);
+	}
+	else
+	{
+		logger(LOG_ERROR,"ws_open","Device %04X:%04X: could not open, code:%d",vendor,product,rv);
+	}
+	
+	return rv;
+}
 
-//------------------
-buf5.delay1 = buf2[240];
-buf5.tempi=buf2[252];
-	if (buf5.tempi==0) strcpy(buf5.winddirection,"N");
-	if (buf5.tempi==1) strcpy(buf5.winddirection,"NNE");
-	if (buf5.tempi==2) strcpy(buf5.winddirection,"NE");
-	if (buf5.tempi==3) strcpy(buf5.winddirection,"ENE");
-	if (buf5.tempi==4) strcpy(buf5.winddirection,"E");
-	if (buf5.tempi==5) strcpy(buf5.winddirection,"ESE");
-	if (buf5.tempi==6) strcpy(buf5.winddirection,"SE");
-	if (buf5.tempi==7) strcpy(buf5.winddirection,"SSE");
-	if (buf5.tempi==8) strcpy(buf5.winddirection,"S");
-	if (buf5.tempi==9) strcpy(buf5.winddirection,"SSW");
-	if (buf5.tempi==10) strcpy(buf5.winddirection,"SW");
-	if (buf5.tempi==11) strcpy(buf5.winddirection,"WSW");
-	if (buf5.tempi==12) strcpy(buf5.winddirection,"W");
-	if (buf5.tempi==13) strcpy(buf5.winddirection,"WNW");
-	if (buf5.tempi==14) strcpy(buf5.winddirection,"NW");
-	if (buf5.tempi==15) strcpy(buf5.winddirection,"NNW");
-buf5.hindoor = buf2[241];
-buf5.tindoor =( (unsigned char) buf2[242] + (unsigned char) buf2[243] *256);
-buf5.tindoor &= 32767;
-//buf5.tindoor = (unsigned char) buf2[242];
-buf5.houtdoor = buf2[244];
-buf5.toutdoor =( (unsigned char) buf2[245] + (unsigned char) buf2[246] *256);
-buf5.toutdoor &= 32767;
-//buf5.toutdoor = (unsigned char) buf2[245];
-buf5.pressure = (unsigned char) buf2[247] + ( 256*buf2[248]);
-buf5.swind = buf2[249];
-buf5.swind2 = buf2[250];
-buf5.oth1  = buf2[251];
-buf5.rain2 = (unsigned char) buf2[253];
-buf5.rain =( (unsigned char) buf2[254] + (unsigned char) buf2[255] *256);
-buf5.rain1 = buf2[254];
-buf5.oth2 = buf2[255];
-//------------------
-/*
-buf4.delay1 = buf2[272];
-buf4.tempi=buf2[284];
-	if (buf4.tempi==0) strcpy(buf4.winddirection,"N");
-	if (buf4.tempi==1) strcpy(buf4.winddirection,"NNE");
-	if (buf4.tempi==2) strcpy(buf4.winddirection,"NE");
-	if (buf4.tempi==3) strcpy(buf4.winddirection,"ENE");
-	if (buf4.tempi==4) strcpy(buf4.winddirection,"E");
-	if (buf4.tempi==5) strcpy(buf4.winddirection,"SEE");
-	if (buf4.tempi==6) strcpy(buf4.winddirection,"SE");
-	if (buf4.tempi==7) strcpy(buf4.winddirection,"SSE");
-	if (buf4.tempi==8) strcpy(buf4.winddirection,"S");
-	if (buf4.tempi==9) strcpy(buf4.winddirection,"SSW");
-	if (buf4.tempi==10) strcpy(buf4.winddirection,"SW");
-	if (buf4.tempi==11) strcpy(buf4.winddirection,"SWW");
-	if (buf4.tempi==12) strcpy(buf4.winddirection,"W");
-	if (buf4.tempi==13) strcpy(buf4.winddirection,"NWW");
-	if (buf4.tempi==14) strcpy(buf4.winddirection,"NW");
-	if (buf4.tempi==15) strcpy(buf4.winddirection,"NNW");
-buf4.hindoor = buf2[273];
-buf4.tindoor =( (unsigned char) buf2[274] + (unsigned char) buf2[275] *256);
-buf4.houtdoor = buf2[276];
-buf4.toutdoor =( (unsigned char) buf2[277] + (unsigned char) buf2[278] *256);
-buf4.pressure = (unsigned char) buf2[279] + ( 256*buf2[280]);
-buf4.swind = buf2[281];
-buf4.swind2 = buf2[282];
-buf4.oth1  = buf2[283];
-buf4.rain2 = (unsigned char) buf2[285];
-buf4.rain =( (unsigned char) buf2[286] + (unsigned char) buf2[287] *256);
-buf4.rain1 = buf2[286];
-buf4.oth2 = buf2[287];
+int ws_close(usb_dev_handle *dev)
+{
+	int rv;
+
+	if (dev)
+	{
+		rv=usb_release_interface(dev, 0);
+		if (rv!=0) logger(LOG_ERROR,"ws_close","Could not release interface, code:%d", rv);
+		
+		rv=usb_close(dev);
+		if (rv!=0) logger(LOG_ERROR,"ws_close","Error closing interface, code:%d", rv);
+	}
+	
+	return rv;
+}
+
+int ws_read(usb_dev_handle *dev,uint16_t address,uint8_t *data,uint16_t size)
+{
+	uint16_t i,c;
+	int rv;
+	uint8_t s,tmp[0x20];
+	
+	memset(data,0,size);
+	
+	logger(LOG_DEBUG,"ws_read","Reading %d bytes from 0x%04X",size,address);
+	
+	i=0;
+	c=sizeof(tmp);
+	s=size-i<c?size-i:c;
+	
+	for (;i<size;i+=s, s=size-i<c?size-i:c)
+	{
+		uint16_t a;
+		char cmd[9];
+		
+		a=address+i;
+		
+		logger(LOG_DEBUG,"ws_read","Send read command: Addr=0x%04X Size=%u",a,s);
+		sprintf(cmd,"\xA1%c%c%c\xA1%c%c%c",a>>8,a,c,a>>8,a,c);
+		rv=usb_control_msg(dev,USB_TYPE_CLASS+USB_RECIP_INTERFACE,9,0x200,0,cmd,sizeof(cmd)-1,1000);
+		logger(LOG_DEBUG,"ws_read","Sent %d of %d bytes",rv,sizeof(cmd)-1); 
+		rv=usb_interrupt_read(dev,0x81,tmp,c,1000);
+		logger(LOG_DEBUG,"ws_read","Read %d of %d bytes",rv,c); 
+		
+		memcpy(data+i,tmp,s);
+	}
+	
+	return 0;
+}
+
+int ws_reset(usb_dev_handle *dev)
+{
+	printf("Resetting WetterStation history\n");
+	
+	usb_control_msg(dev,USB_TYPE_CLASS+USB_RECIP_INTERFACE,9,0x200,0,"\xA0\x00\x00\x20\xA0\x00\x00\x20",8,1000);
+	usb_control_msg(dev,USB_TYPE_CLASS+USB_RECIP_INTERFACE,9,0x200,0,"\x55\x55\xAA\xFF\xFF\xFF\xFF\xFF",8,1000);
+	//_send_usb_msg("\xa0","\x00","\x00","\x20","\xa0","\x00","\x00","\x20");
+	//_send_usb_msg("\x55","\x55","\xaa","\xff","\xff","\xff","\xff","\xff");
+	usleep(28*1000);
+	
+	usb_control_msg(dev,USB_TYPE_CLASS+USB_RECIP_INTERFACE,9,0x200,0,"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF",8,1000);
+	//_send_usb_msg("\xff","\xff","\xff","\xff","\xff","\xff","\xff","\xff");
+	usleep(28*1000);
+	
+	//_send_usb_msg("\x05","\x20","\x01","\x38","\x11","\x00","\x00","\x00");
+	usb_control_msg(dev,USB_TYPE_CLASS+USB_RECIP_INTERFACE,9,0x200,0,"\x05\x20\x01\x38\x11\x00\x00\x00",8,1000);
+	usleep(28*1000);
+	
+	//_send_usb_msg("\x00","\x00","\xaa","\x00","\x00","\x00","\x20","\x3e");
+	usb_control_msg(dev,USB_TYPE_CLASS+USB_RECIP_INTERFACE,9,0x200,0,"\x00\x00\xAA\x00\x00\x00\x20\x3E",8,1000);
+	usleep(28*1000);
+	
+	return 0;
+}
+
+int ws_print(char *format,uint8_t *buffer)
+{
+        char *dir[]=
+        {
+                "N","NNE","NE","ENE","E","ESE","SE","SSE",
+                "S","SSW","SW","WSW","W","WNW","NW","NNW"
+        };
+        char *dirdeg[]=
+        {
+                "0","23","45","68","90","113","135","158",
+                "180","203","225","248","270","293","315","338"
+        };
+/*	char *dirslovak[]=		{"S","SSV","SV","VSV","V","VJV","JV","JJV",
+                	                 "J","JJZ","JZ","ZJZ","Z","ZSZ","SZ","SSZ"};	
 */
+        time_t basictime;
+        char datestring[50];  
+        float p,temp,m,windspeed,tw,hum,gama;
 
-if ( showJSON) {
-  printf("{\"temperature\":%4.1f,\"humidity\":%d,\"pressure\":%6.1f}\n",
-	 buf5.tindoor/10.0, buf5.hindoor, buf5.pressure/10.0);
-  exit(0);
+	for (;*format;format++)
+	{
+		if (*format=='%')
+		{
+			switch (*++format)
+			{
+				case 'h': // inside humidity
+					printf("%d",buffer[0x01]);
+					break;
+				
+				case 'H': // outside humidity
+					printf("%d",buffer[0x04]);
+					break;
+				
+				case 't': // inside temperature
+					if ((buffer[0x03] & 128) > 0) { //fix negative temperature
+					    printf("-%0.1f",(float)((buffer[0x02]+(buffer[0x03]<<8))& 32767)/10);
+					} else {
+					    printf("%0.1f",(float)((buffer[0x02]+(buffer[0x03]<<8))& 32767)/10);
+					};	
+					break;
+				
+				case 'T': // outside temperature
+					if ((buffer[0x06] & 128) > 0) { //fix negative temperature
+					    printf("-%0.1f",(float)((buffer[0x05]+(buffer[0x06]<<8))& 32767)/10);
+					} else {
+					    printf("%0.1f",(float)((buffer[0x05]+(buffer[0x06]<<8))& 32767)/10);
+					};
+					break;	
+
+				case 'C': // dew point based on outside temperature (formula from wikipedia)
+                                        temp=(float)(buffer[0x05]+(buffer[0x06]<<8))/10; //out temp celsius
+					hum=(float)buffer[0x04]/100; 			 //humidity / 100
+					if (hum == 0) hum=0.001;			 //in case of 0% humidity
+					gama=(17.271*temp)/(237.7+temp) + log (hum);	 //gama=aT/(b+T) + ln (RH/100)
+					tw= (237.7 * gama) / (17.271 - gama);		 //Tdew= (b * gama) / (a - gama)
+					printf("%0.1f",tw);
+					break;
+
+				case 'c': // windchill temperature
+                                        temp=(float)(buffer[0x05]+(buffer[0x06]<<8))/10; //out temp celsius
+					windspeed=(float)(buffer[0x09])/10 * 3.6;        //in km/h
+					if (( windspeed > 4.8 ) && (temp < 10)) //formula from wikipedia only at condition
+                                        tw=13.12 + 0.6215 * temp - 11.37*pow(windspeed,0.16) + 0.3965*temp*pow(windspeed,0.16);
+					else tw=temp; 				//else nothing..
+					printf("%0.1f",tw);
+					break;
+				
+				case 'W': // wind speed
+					printf("%0.1f",(float)(buffer[0x09])/10);
+					break;
+				
+				case 'G': // wind gust
+					printf("%0.1f",(float)(buffer[0x0A])/10);
+					break;
+				
+				case 'D': // wind direction - named
+					printf(dir[buffer[0x0C]<sizeof(dir)/sizeof(dir[0])?buffer[0x0C]:0]);
+					break;
+
+				case 'd': // wind direction - degrees
+					printf(dirdeg[buffer[0x0C]<sizeof(dir)/sizeof(dir[0])?buffer[0x0C]:0]);
+					break;
+				
+				case 'P': // pressure
+					printf("%0.1f",(float)(buffer[0x07]+(buffer[0x08]<<8))/10);
+					break;
+				
+				case 'p': // rel. pressure
+                                        p=(float)(buffer[0x07]+(buffer[0x08]<<8))/10; //abs. pressure
+					temp=(float)(buffer[0x05]+(buffer[0x06]<<8))/10; //out temp
+					m=altitude / (18429.1 + 67.53 * temp + 0.003 * altitude); //power exponent to correction function
+					p=p * pow(10,m); //relative pressure * correction
+					printf("%0.1f",p);
+					break;
+				
+				case 'R': // rain
+					printf("%0.1f",(float)(buffer[0x0D]+(buffer[0x0E]<<8))*0.3);
+					break;
+
+				case 'N': // date
+				        time(&basictime);
+				        strftime(datestring,sizeof(datestring),"%Y-%m-%d %H:%M:%S",
+			                 localtime(&basictime));
+				        // Print out and leave
+				        printf("%s",datestring);
+					break;
+				case '%': // percents
+				        printf("%%");
+					break;
+			}
+		}
+		else if (*format=='\\')
+		{
+			switch (*++format)
+			{
+				case 'n':
+					printf("\n");
+					break;
+				
+				case 'r':
+					printf("\r");
+					break;
+				
+				case 't':
+					printf("\t");
+					break;
+				
+			}
+		}
+		else
+		{
+			printf("%c",*format);
+		}
+	}
+/*	printf("rain?:           %0.1f (this is always zero)\n",(float)(buffer[253])/10);
+	printf("rain:            %0.1f (24h?)\n",(float)(buffer[254]+(buffer[255]<<8))/10);
+	printf("rain1:           %d\n",buffer[254]);
+	printf("rain2:           %d\n",buffer[253]);
+	printf("other 1:         %d\n",buffer[251]);
+	printf("other 2:         %d\n",buffer[255]);
+	printf("\n");*/
+	
+	return 0;
 }
 
-
-printf("Last saved values:\n");
-unsigned int remain;
-if ( (showall==1) | ( o1==1) ) printf("224:\t\tinterval:\t\t%5d\n", buf4.delay1);
-if ( (showall==1) | ( o2==1) ) printf("225:\t\tindoor humidity\t\t%5d\n", buf4.hindoor);
-if ( (showall==1) | ( o2==1) ) printf("228:\t\toutdoor humidity\t%5d\n", buf4.houtdoor);
-remain = buf4.tindoor%10;
-if ((signed) remain<0) remain = remain * -1;
-if ( (showall==1) | ( o3==1) ) printf("226 227:\tindoor temperature\t%5d.%d\n", buf4.tindoor / 10 ,remain);
-remain = buf4.toutdoor%10;
-
-if ((signed) remain<0) remain = remain * -1;
-if ( (showall==1) | ( o3==1) ) printf("229 230:\toutdoor temperature\t%5d.%d\n", buf4.toutdoor / 10 ,remain);
-remain = buf4.swind%10;
-if ( (showall==1) | ( o4==1) ) printf("233:\t\twind speed\t\t%5d.%d\n", buf4.swind / 10 , remain);
-remain = buf4.swind2%10;
-if ( (showall==1) | ( o4==1) ) printf("234:\t\twind gust\t\t%5d.%d\n", buf4.swind2 / 10 , remain);
-if ( (showall==1) | ( o4==1) ) printf("236:\t\twind direction\t\t%5s\n", buf4.winddirection);
-remain = buf4.rain%10;
-if ( (showall==1) | ( o5==1) ) printf("238 239:\train?\t\t\t%5d.%d\n", buf4.rain / 10 , remain);
-remain = (buf4.rain2)%10;
-if ( (showall==1) | ( o5==1) ) printf("237:\t\train - ??\t\t%5d.%d\n", buf4.rain2 / 10 , remain);
-if ( (showall==1) | ( o5==1) ) printf("248:\t\train1\t\t\t%5d\n", buf4.rain1);
-if ( (showall==1) | ( o5==1) ) printf("\t\train2\t\t\t%5d\n", buf4.rain2);
-if ( (showall==1) | ( o6==1) ) printf("235:\t\tother 1\t\t\t%5d\n", buf4.oth1);
-if ( (showall==1) | ( o6==1) ) printf("239:\t\tother 2\t\t\t%5d\n", buf4.oth2);
-remain = buf4.pressure%10;
-if ( (showall==1) | ( o9==1) ) printf("231 232:\tpressure(hPa)\t\t%5d.%d\n", buf4.pressure / 10 , remain);
-if ( (showall==1) | ( o7==1) ) printf("\t\tCurrent history pos:\t%5x\n", buf4.noffset);
-printf("\n");
-
-//------------------
-printf("Current values:\n");
-if ( (showall==1) | ( o1==1) ) printf("240:\t\tSince last save:\t%5dmin\n", buf5.delay1);
-if ( (showall==1) | ( o2==1) ) printf("241:\t\tindoor humidity\t\t%5d\n", buf5.hindoor);
-if ( (showall==1) | ( o2==1) ) printf("244:\t\toutdoor humidity\t%5d\n", buf5.houtdoor);
-remain = buf5.tindoor%10;
-if ((signed) remain<0) remain = remain * -1;
-if ( (showall==1) | ( o3==1) ) printf("242 243:\tindoor temperature\t%5d.%d\n", buf5.tindoor / 10 ,remain);
-remain = buf5.toutdoor%10;
-if ((signed) remain<0) remain = remain * -1;
-if ( (showall==1) | ( o3==1) ) printf("245 246:\toutdoor temperature\t%5d.%d\n", buf5.toutdoor / 10 ,remain);
-remain = buf5.swind%10;
-if ( (showall==1) | ( o4==1) ) printf("249:\t\twind speed\t\t%5d.%d\n", buf5.swind / 10 , remain);
-remain = buf5.swind2%10;
-if ( (showall==1) | ( o4==1) ) printf("250:\t\twind gust\t\t%5d.%d\n", buf5.swind2 / 10 , remain);
-if ( (showall==1) | ( o4==1) ) printf("252:\t\twind direction\t\t%5s\n", buf5.winddirection);
-remain = buf5.rain%10;
-if ( (showall==1) | ( o5==1) ) printf("254 255:\train? this is always zero %5d.%d\n", buf5.rain / 10 , remain);
-remain = (buf5.rain2)%10;
-if ( (showall==1) | ( o5==1) ) printf("253:\t\train - 24h?\t\t%5d.%d\n", buf5.rain2 / 10 , remain);
-if ( (showall==1) | ( o5==1) ) printf("254:\t\train1\t\t\t%5d\n", buf5.rain1);
-if ( (showall==1) | ( o5==1) ) printf("\t\train2\t\t\t%5d\n", buf5.rain2);
-if ( (showall==1) | ( o6==1) ) printf("251:\t\tother 1\t\t\t%5d\n", buf5.oth1);
-if ( (showall==1) | ( o6==1) ) printf("255:\t\tother 2\t\t\t%5d\n", buf5.oth2);
-remain = buf5.pressure%10;
-if ( (showall==1) | ( o9==1) ) printf("247 248:\tpressure(hPa)\t\t%5d.%d\n", buf5.pressure / 10 , remain);
-if ( (showall==1) | ( o7==1) ) printf("\t\tCurrent history pos:\t%5x\n", buf5.noffset);
-printf("\n");
-
-
-//The only difference is the order of words in printf. This changes the description of values in graphs. Values are processed correctly anyway.
-if (postprocess==1) {
-printf ("For postprocessing\n");
-printf ("Interval\t%d min\n", buf5.delay1);
-printf ("Indoor humidity\t%d %%\n", buf5.hindoor);
-printf ("Outdoor humidity\t%d %%\n", buf5.houtdoor);
-if ((buf2[243] & 128) > 0) {
-	printf ("Indoor temperature\t-%d.%d C\n", buf5.tindoor / 10, abs(buf5.tindoor % 10));
-} else {
-	printf ("Indoor temperature\t%d.%d C\n", buf5.tindoor / 10, abs(buf5.tindoor % 10));
-};
-if ((buf2[246] & 128) > 0) {
-	printf ("Outdoor temperature\t-%d.%d C\n", buf5.toutdoor / 10, abs(buf5.toutdoor % 10));
-} else {
-	printf ("Outdoor temperature\t%d.%d C\n", buf5.toutdoor / 10, abs(buf5.toutdoor % 10));
-};
-printf ("Wind speed\t%d.%d m/s\n", buf5.swind / 10, abs(buf5.swind %10));
-printf ("Wind gust\t%d.%d m/s\n", buf5.swind2 / 10, abs(buf5.swind %10));
-printf ("Wind direction\t%d %s\n", buf2[252], buf5.winddirection);
-if (buf5.delay1 != 0) {
-	printf ("Rain 1h\t%.1f mm/h\n", (double)((buf5.rain2 - buf4.rain2) + (buf5.rain1 - buf4.rain1)*256)*0.3*(60/buf5.delay1) );
-} else {
-	printf ("Rain 1h\t%.1f mm/h\n", 0.0);
+int ws_dump(uint16_t address,uint8_t *data,uint16_t size,uint8_t w)
+{
+	uint16_t i,j,s;
+	char *buf;
+	
+	s=8+(w*5)+1;
+	logger(LOG_DEBUG,"ws_dump","Allocate %u bytes for temporary buffer",s);
+	buf=malloc(s);
+	if (!buf) logger(LOG_WARNING,"ws_dump","Could not allocate %u bytes for temporary buffer, verbose dump enabled",s);
+	
+	logger(LOG_INFO,"ws_dump","Dump %u bytes from address 0x%04X",size,address);
+	for (i=0;i<size && buf && data;)
+	{
+		if (buf) sprintf(buf,"0x%04X:",address+i);
+		for (j=0;j<w && i<size;i++,j++)
+		{
+			if (buf)
+			{
+				sprintf(buf,"%s 0x%02X",buf,data[i]);
+			} else
+			{
+				logger(LOG_INFO,"ws_dump","0x%04X: 0x%02X",address+i,data[i]);
+			}
+		}
+		if (buf) logger(LOG_INFO,"ws_dump",buf);
+	}
+	
+	return 0;
 }
-printf ("Rain total\t%.1f  mm\n", (double)(buf5.rain2 + buf5.rain1*256) * 0.3);
-printf ("Air pressure\t%d.%d hPa\n", buf5.pressure / 10, buf5.pressure % 10);
-printf ("\n");
-}
-//------------------
 
-_close_readw();
-return 0;
+void logger(log_event event,char *function,char *msg,...)
+{
+	va_list args;
+	
+	va_start(args,msg);
+	switch (event)
+	{
+		case LOG_DEBUG:
+			if (_log_debug)
+			{
+				fprintf(_log_debug,"message: wwsr.%s - ",function);
+				vfprintf(_log_debug,msg,args);
+				fprintf(_log_debug,"\n");
+			}
+			break;
+		
+		case LOG_WARNING:
+			if (_log_warning)
+			{
+				fprintf(_log_warning,"warning: wwsr.%s - ",function);
+				vfprintf(_log_warning,msg,args);
+				fprintf(_log_warning,"\n");
+			}
+			break;
+		
+		case LOG_ERROR:
+			if (_log_error)
+			{
+				fprintf(_log_error,"error: wwsr.%s - ",function);
+				vfprintf(_log_error,msg,args);
+				fprintf(_log_error,"\n");
+			}
+			break;
+		
+		case LOG_INFO:
+			if (_log_info)
+			{
+				fprintf(_log_info,"info: wwsr.%s - ",function);
+				vfprintf(_log_info,msg,args);
+				fprintf(_log_info,"\n");
+			}
+			break;
+	}
+	va_end(args);
 }
+
